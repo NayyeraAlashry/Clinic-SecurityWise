@@ -1,0 +1,453 @@
+from datetime import datetime, timezone as dt_timezone, date as dt_date
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from django.contrib.auth.models import Group, Permission
+from django.db.models import Avg, Exists, OuterRef
+from rest_framework import serializers
+
+from authentication.models import Doctor, User
+from clinic_management.models import (
+    Appointment,
+    DoctorSchedule,
+    Notification,
+    PatientDiagnosis,
+    PatientPrescription,
+    Review,
+    TimeSlot,
+    TimeSlotStatus,
+)
+
+
+def resolve_output_timezone(request):
+    if request is None:
+        return ZoneInfo("UTC")
+
+    timezone_name = request.query_params.get("timezone", "UTC")
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def serialize_slot_datetime(slot, value, request):
+    tz = resolve_output_timezone(request)
+    utc_value = datetime.combine(slot.scheduleId.date, value, tzinfo=dt_timezone.utc)
+    return utc_value.astimezone(tz).isoformat()
+
+
+def resolve_user_role(user):
+    if user.is_superuser or user.groups.filter(name="MasterUser").exists():
+        return "admin"
+    if (
+        user.groups.filter(name="Doctor").exists()
+        or user.has_perm("clinic_management.view_doctorschedule")
+    ):
+        return "doctor"
+    if (
+        user.groups.filter(name="Patient").exists()
+        or user.has_perm("clinic_management.add_appointment")
+    ):
+        return "patient"
+    return None
+
+
+class TimeSlotSerializer(serializers.ModelSerializer):
+    scheduleId = serializers.UUIDField(source="scheduleId_id", read_only=True)
+    doctorId = serializers.UUIDField(source="scheduleId.doctorId_id", read_only=True)
+    date = serializers.DateField(source="scheduleId.date", read_only=True)
+    startDateTime = serializers.SerializerMethodField()
+    endDateTime = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TimeSlot
+        fields = [
+            "id",
+            "scheduleId",
+            "doctorId",
+            "date",
+            "startTime",
+            "endTime",
+            "startDateTime",
+            "endDateTime",
+            "status",
+        ]
+
+    def get_startDateTime(self, obj):
+        return serialize_slot_datetime(obj, obj.startTime, self.context.get("request"))
+
+    def get_endDateTime(self, obj):
+        return serialize_slot_datetime(obj, obj.endTime, self.context.get("request"))
+
+
+class DoctorListSerializer(serializers.ModelSerializer):
+    first_Name = serializers.CharField(source="first_name", read_only=True)
+    last_Name = serializers.CharField(source="last_name", read_only=True)
+    averageRating = serializers.SerializerMethodField()
+    role = serializers.SerializerMethodField()
+    pfpUrl = serializers.SerializerMethodField()
+    availableToday = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Doctor
+        fields = [
+            "userId",
+            "email",
+            "first_Name",
+            "last_Name",
+            "phoneNo",
+            "createdAt",
+            "specialization",
+            "bio",
+            "location",
+            "yearsOfExperience",
+            "averageRating",
+            "role",
+            "pfpUrl",
+            "availableToday",
+        ]
+
+    def get_availableToday(self, obj):
+        today = dt_date.today()
+        return TimeSlot.objects.filter(
+            scheduleId__doctorId=obj,
+            scheduleId__date=today,
+            status=TimeSlotStatus.AVAILABLE
+        ).exists()
+
+    def get_averageRating(self, obj):
+        avg = obj.reviews.aggregate(avg=Avg("rating"))["avg"]
+        if avg is None:
+            return None
+        return float(round(avg, 2))
+
+    def get_role(self, obj):
+        return resolve_user_role(obj)
+
+    def get_pfpUrl(self, obj):
+        request = self.context.get("request")
+        if not obj.pfp:
+            return None
+        if request is None:
+            return obj.pfp.url
+        return request.build_absolute_uri(obj.pfp.url)
+
+
+class DoctorDetailSerializer(DoctorListSerializer):
+    pass
+
+
+class DoctorScheduleSerializer(serializers.ModelSerializer):
+    doctorId = serializers.UUIDField(source="doctorId_id", read_only=True)
+    timeSlots = TimeSlotSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = DoctorSchedule
+        fields = [
+            "id",
+            "doctorId",
+            "date",
+            "startTime",
+            "endTime",
+            "slotDuration",
+            "timeSlots",
+        ]
+
+
+class DoctorScheduleCreateSerializer(serializers.Serializer):
+    date = serializers.DateField()
+    startTime = serializers.TimeField()
+    endTime = serializers.TimeField()
+
+
+class DoctorRecurringScheduleCreateSerializer(serializers.Serializer):
+    startDate = serializers.DateField()
+    endDate = serializers.DateField()
+    workingDays = serializers.ListField(
+        child=serializers.IntegerField(min_value=0, max_value=6),
+        allow_empty=False,
+    )
+    startTime = serializers.TimeField()
+    endTime = serializers.TimeField()
+
+    def validate_workingDays(self, value):
+        if len(set(value)) != len(value):
+            raise serializers.ValidationError("workingDays must contain unique values")
+        return value
+
+
+class AppointmentSerializer(serializers.ModelSerializer):
+    doctorId = serializers.UUIDField(source="doctorId_id", read_only=True)
+    patientId = serializers.UUIDField(source="patientId_id", read_only=True)
+    patientName = serializers.SerializerMethodField()
+    doctorName = serializers.SerializerMethodField()
+    doctorSpecialization = serializers.CharField(source="doctorId.specialization", read_only=True)
+    doctorPfpUrl = serializers.SerializerMethodField()
+    patientPfpUrl = serializers.SerializerMethodField()
+    timeSlotId = serializers.UUIDField(source="timeSlotId_id", read_only=True)
+    timeSlot = TimeSlotSerializer(source="timeSlotId", read_only=True)
+
+    def get_patientName(self, obj):
+        patient = obj.patientId
+        full_name = (
+            f"{getattr(patient, 'first_name', '')} {getattr(patient, 'last_name', '')}"
+        ).strip()
+        name = full_name or getattr(patient, "fullName", "") or patient.email
+        import re
+        return re.sub(r"\s*Account\s*$", "", name, flags=re.IGNORECASE)
+
+    def get_doctorName(self, obj):
+        doctor = obj.doctorId
+        full_name = (
+            f"{getattr(doctor, 'first_name', '')} {getattr(doctor, 'last_name', '')}"
+        ).strip()
+        return full_name or getattr(doctor, "fullName", "") or doctor.email
+
+    def get_doctorPfpUrl(self, obj):
+        request = self.context.get("request")
+        doctor = obj.doctorId
+        if not getattr(doctor, "pfp", None):
+            return None
+        if request is None:
+            return doctor.pfp.url
+        return request.build_absolute_uri(doctor.pfp.url)
+
+    def get_patientPfpUrl(self, obj):
+        request = self.context.get("request")
+        patient = obj.patientId
+        if not getattr(patient, "pfp", None):
+            return None
+        if request is None:
+            return patient.pfp.url
+        return request.build_absolute_uri(patient.pfp.url)
+
+    class Meta:
+        model = Appointment
+        fields = [
+            "id",
+            "doctorId",
+            "doctorName",
+            "doctorSpecialization",
+            "doctorPfpUrl",
+            "patientId",
+            "patientName",
+            "patientPfpUrl",
+            "timeSlotId",
+            "timeSlot",
+            "status",
+            "notes",
+            "createdAt",
+        ]
+
+
+class AppointmentBookingSerializer(serializers.Serializer):
+    timeSlotId = serializers.UUIDField()
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class FollowUpAppointmentCreateSerializer(serializers.Serializer):
+    timeSlotId = serializers.UUIDField()
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class ReviewSerializer(serializers.ModelSerializer):
+    doctorId = serializers.UUIDField(source="doctorId_id", read_only=True)
+    patientId = serializers.UUIDField(source="patientId_id", read_only=True)
+    patientName = serializers.SerializerMethodField()
+    appointmentId = serializers.UUIDField(source="appointmentId_id", read_only=True)
+
+    class Meta:
+        model = Review
+        fields = [
+            "id",
+            "doctorId",
+            "patientId",
+            "patientName",
+            "appointmentId",
+            "rating",
+            "comment",
+            "createdAt",
+        ]
+
+    def get_patientName(self, obj):
+        patient = obj.patientId
+        full_name = (
+            f"{getattr(patient, 'first_name', '')} {getattr(patient, 'last_name', '')}"
+        ).strip()
+        name = full_name or getattr(patient, "fullName", "") or patient.email
+        import re
+        return re.sub(r"\s*Account\s*$", "", name, flags=re.IGNORECASE)
+
+
+class ReviewCreateSerializer(serializers.Serializer):
+    appointmentId = serializers.UUIDField()
+    rating = serializers.IntegerField(min_value=1, max_value=5)
+    comment = serializers.CharField()
+
+
+class PatientDiagnosisSerializer(serializers.ModelSerializer):
+    patientId = serializers.UUIDField(source="patientId_id", read_only=True)
+    doctorId = serializers.UUIDField(source="doctorId_id", read_only=True)
+    appointmentId = serializers.UUIDField(source="appointmentId_id", read_only=True)
+
+    class Meta:
+        model = PatientDiagnosis
+        fields = [
+            "id",
+            "patientId",
+            "doctorId",
+            "appointmentId",
+            "diagnosis",
+            "dateDiagnosed",
+        ]
+
+
+class PatientDiagnosisCreateSerializer(serializers.Serializer):
+    appointmentId = serializers.UUIDField()
+    diagnosis = serializers.CharField()
+
+
+class PatientDiagnosisUpdateSerializer(serializers.Serializer):
+    diagnosis = serializers.CharField()
+
+
+class PatientPrescriptionSerializer(serializers.ModelSerializer):
+    patientId = serializers.UUIDField(source="patientId_id", read_only=True)
+    doctorId = serializers.UUIDField(source="doctorId_id", read_only=True)
+    appointmentId = serializers.UUIDField(source="appointmentId_id", read_only=True)
+
+    class Meta:
+        model = PatientPrescription
+        fields = [
+            "id",
+            "patientId",
+            "doctorId",
+            "appointmentId",
+            "prescription",
+            "dose",
+            "duration",
+            "isPermanent",
+            "datePrescribed",
+        ]
+
+
+class PatientPrescriptionCreateSerializer(serializers.Serializer):
+    appointmentId = serializers.UUIDField()
+    prescription = serializers.CharField()
+    dose = serializers.CharField()
+    duration = serializers.CharField()
+    isPermanent = serializers.BooleanField()
+
+
+class PatientPrescriptionUpdateSerializer(serializers.Serializer):
+    prescription = serializers.CharField(required=False)
+    dose = serializers.CharField(required=False)
+    duration = serializers.CharField(required=False)
+    isPermanent = serializers.BooleanField(required=False)
+
+
+class MedicalHistorySerializer(serializers.Serializer):
+    medicalRecordId = serializers.UUIDField()
+    patientId = serializers.UUIDField()
+    appointments = AppointmentSerializer(many=True)
+    diagnoses = PatientDiagnosisSerializer(many=True)
+    prescriptions = PatientPrescriptionSerializer(many=True)
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    userId = serializers.UUIDField(source="userId_id", read_only=True)
+
+    class Meta:
+        model = Notification
+        fields = ["id", "userId", "message", "type", "sentAt"]
+
+
+class PermissionSerializer(serializers.ModelSerializer):
+    app_label = serializers.CharField(source="content_type.app_label", read_only=True)
+    model = serializers.CharField(source="content_type.model", read_only=True)
+
+    class Meta:
+        model = Permission
+        fields = ["id", "name", "codename", "app_label", "model"]
+
+
+class UserAdminSerializer(serializers.ModelSerializer):
+    first_Name = serializers.CharField(source="first_name", read_only=True)
+    last_Name = serializers.CharField(source="last_name", read_only=True)
+    role = serializers.SerializerMethodField()
+    pfpUrl = serializers.SerializerMethodField()
+    user_permissions = PermissionSerializer(many=True, read_only=True)
+    user_permission_ids = serializers.PrimaryKeyRelatedField(
+        queryset=Permission.objects.filter(
+            codename__in=[
+                'view_appointment', 'add_appointment', 'change_appointment',
+                'view_medicalrecord', 'add_medicalrecord', 'change_medicalrecord',
+                'add_patientdiagnosis', 'change_patientdiagnosis', 'view_patientdiagnosis',
+                'add_patientprescription', 'change_patientprescription', 'view_patientprescription',
+                'add_doctorschedule', 'change_doctorschedule', 'view_doctorschedule',
+                'add_review', 'view_review',
+                'view_notification'
+            ]
+        ),
+        many=True,
+        write_only=True,
+        source="user_permissions",
+        required=False,
+    )
+
+    class Meta:
+        model = User
+        fields = [
+            "userId",
+            "email",
+            "first_Name",
+            "last_Name",
+            "phoneNo",
+            "createdAt",
+            "is_active",
+            "role",
+            "pfpUrl",
+            "user_permissions",
+            "user_permission_ids",
+        ]
+
+    def get_role(self, obj):
+        return resolve_user_role(obj)
+
+    def get_pfpUrl(self, obj):
+        request = self.context.get("request")
+        if not obj.pfp:
+            return None
+        if request is None:
+            return obj.pfp.url
+        return request.build_absolute_uri(obj.pfp.url)
+
+
+class DoctorAdminSerializer(DoctorListSerializer):
+    is_active = serializers.BooleanField(read_only=True)
+
+    class Meta(DoctorListSerializer.Meta):
+        fields = DoctorListSerializer.Meta.fields + ["is_active"]
+
+
+class GroupPermissionSerializer(serializers.ModelSerializer):
+    permissions = PermissionSerializer(many=True, read_only=True)
+    permission_ids = serializers.PrimaryKeyRelatedField(
+        queryset=Permission.objects.filter(
+            codename__in=[
+                'view_appointment', 'add_appointment', 'change_appointment',
+                'view_medicalrecord', 'add_medicalrecord', 'change_medicalrecord',
+                'add_patientdiagnosis', 'change_patientdiagnosis', 'view_patientdiagnosis',
+                'add_patientprescription', 'change_patientprescription', 'view_patientprescription',
+                'add_doctorschedule', 'change_doctorschedule', 'view_doctorschedule',
+                'add_review', 'view_review',
+                'view_notification'
+            ]
+        ),
+        many=True,
+        write_only=True,
+        source="permissions",
+    )
+
+    class Meta:
+        model = Group
+        fields = ["id", "name", "permissions", "permission_ids"]
